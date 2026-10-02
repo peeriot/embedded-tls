@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Fix the client accepting a server `Finished` without server authentication (#215). The client now requires a verified `Certificate` and `CertificateVerify`, in that order, or a pre-shared key it offered.
+
 ## 0.19.0
 
 - Added post-quantum hybrid named groups.

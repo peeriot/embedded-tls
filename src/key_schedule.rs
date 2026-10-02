@@ -496,4 +496,27 @@ where
         //info!("verified {:?}", verified);
         //unimplemented!()
     }
+
+    /// The `Finished` that a server holding the handshake secret sends for the current
+    /// transcript. A peer that chose its own key share can always make one.
+    #[cfg(test)]
+    pub(crate) fn server_finished(
+        &self,
+    ) -> Result<Finished<HashOutputSize<CipherSuite>>, TlsError> {
+        let key = self
+            .state
+            .traffic_secret
+            .make_expanded_hkdf_label::<HashOutputSize<CipherSuite>>(
+                b"finished",
+                ContextType::None,
+            )?;
+        let hash = self.transcript_hash.clone().finalize();
+        let mut hmac = SimpleHmac::<CipherSuite::Hash>::new_from_slice(&key)
+            .map_err(|_| TlsError::InternalError)?;
+        Mac::update(&mut hmac, &hash);
+        Ok(Finished {
+            verify: hmac.finalize().into_bytes(),
+            hash: Some(hash),
+        })
+    }
 }
