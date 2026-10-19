@@ -2,9 +2,10 @@ use core::marker::PhantomData;
 
 use digest::{Digest, OutputSizeUser};
 use heapless::Vec;
-use p256::EncodedPoint;
+use p256::Sec1Point;
 use p256::ecdh::EphemeralSecret;
-use p256::elliptic_curve::rand_core::RngCore;
+use p256::elliptic_curve::Generate;
+use rand_core::Rng as _;
 use typenum::Unsigned;
 
 use crate::TlsError;
@@ -49,12 +50,12 @@ where
             config,
             random,
             cipher_suite: PhantomData,
-            secret: EphemeralSecret::random(&mut provider.rng()),
+            secret: EphemeralSecret::generate_from_rng(&mut provider.rng()),
         }
     }
 
     pub(crate) fn encode(&self, buf: &mut CryptoBuffer<'_>) -> Result<(), TlsError> {
-        let public_key = EncodedPoint::from(&self.secret.public_key());
+        let public_key = Sec1Point::from(&self.secret.public_key());
         let public_key = public_key.as_ref();
 
         buf.push_u16(LEGACY_VERSION)

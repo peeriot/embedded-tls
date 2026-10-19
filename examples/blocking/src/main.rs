@@ -2,12 +2,13 @@ use embedded_io::Write as _;
 use embedded_io_adapters::std::FromStd;
 use embedded_tls::blocking::*;
 use embedded_tls::webpki::CertVerifier;
-use rand::rngs::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use std::net::TcpStream;
 use std::time::SystemTime;
 
 struct Provider<'a> {
-    rng: OsRng,
+    rng: UnwrapErr<SysRng>,
     verifier: CertVerifier<'a, Aes128GcmSha256, SystemTime, 4096>,
 }
 
@@ -57,7 +58,7 @@ fn main() {
     tls.open(TlsContext::new(
         &config,
         Provider {
-            rng: OsRng,
+            rng: UnwrapErr(SysRng),
             verifier: CertVerifier::new(Certificate::X509(&der)),
         },
     ))

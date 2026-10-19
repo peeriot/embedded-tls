@@ -3,7 +3,8 @@ use digest::FixedOutputReset;
 use embedded_io_adapters::tokio_1::FromTokio;
 use embedded_tls::pki::CertVerifier;
 use embedded_tls::{Aes128GcmSha256, CryptoProvider, SignatureScheme, TlsError, TlsVerifier};
-use rand_core::{CryptoRngCore, OsRng};
+use getrandom::SysRng;
+use rand_core::{CryptoRng, UnwrapErr};
 use rsa::pkcs8::DecodePrivateKey;
 use rustls::server::AllowAnyAnonymousOrAuthenticatedClient;
 use sha2::{Digest, Sha256};
@@ -19,14 +20,12 @@ static LOG_INIT: Once = Once::new();
 static INIT: Once = Once::new();
 static mut ADDR: Option<SocketAddr> = None;
 
-struct RsaPssSigningKey<D: Digest, R: CryptoRngCore> {
+struct RsaPssSigningKey<D: Digest, R: CryptoRng> {
     rng: R,
     key: rsa::pss::SigningKey<D>,
 }
 
-impl<D: Digest + FixedOutputReset, R: CryptoRngCore> SignerMut<Box<[u8]>>
-    for RsaPssSigningKey<D, R>
-{
+impl<D: Digest + FixedOutputReset, R: CryptoRng> SignerMut<Box<[u8]>> for RsaPssSigningKey<D, R> {
     fn try_sign(&mut self, msg: &[u8]) -> Result<Box<[u8]>, rsa::signature::Error> {
         let signature = self.key.try_sign_with_rng(&mut self.rng, msg)?;
         Ok(signature.into())
@@ -34,7 +33,7 @@ impl<D: Digest + FixedOutputReset, R: CryptoRngCore> SignerMut<Box<[u8]>>
 }
 
 struct RustPkiProvider<'a> {
-    rng: rand::rngs::OsRng,
+    rng: UnwrapErr<SysRng>,
     verifier: CertVerifier<'a, Aes128GcmSha256, SystemTime, 4096>,
     priv_key: Option<&'a [u8]>,
     client_cert: Option<embedded_tls::Certificate<&'a [u8]>>,
@@ -156,7 +155,7 @@ async fn test_server_certificate_validation() {
     let open_fut = tls.open(TlsContext::new(
         &config,
         RustPkiProvider {
-            rng: OsRng,
+            rng: UnwrapErr(SysRng),
             verifier: CertVerifier::new(Certificate::X509(&der[..])),
             priv_key: Some(&key_der),
             client_cert: Some(Certificate::X509(&cli_der[..])),

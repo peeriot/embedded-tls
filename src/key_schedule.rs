@@ -2,22 +2,18 @@ use crate::handshake::binder::PskBinder;
 use crate::handshake::finished::Finished;
 use crate::{TlsError, config::TlsCipherSuite};
 use digest::OutputSizeUser;
-use digest::generic_array::ArrayLength;
-use hmac::{Mac, SimpleHmac};
+use hmac::{KeyInit, Mac, SimpleHmac};
+use hybrid_array::{Array, ArraySize, typenum::Unsigned};
 use sha2::Digest;
-use sha2::digest::generic_array::{GenericArray, typenum::Unsigned};
 
 pub type HashOutputSize<CipherSuite> =
     <<CipherSuite as TlsCipherSuite>::Hash as OutputSizeUser>::OutputSize;
 
-pub type IvArray<CipherSuite> = GenericArray<u8, <CipherSuite as TlsCipherSuite>::IvLen>;
-pub type KeyArray<CipherSuite> = GenericArray<u8, <CipherSuite as TlsCipherSuite>::KeyLen>;
-pub type HashArray<CipherSuite> = GenericArray<u8, HashOutputSize<CipherSuite>>;
+pub type IvArray<CipherSuite> = Array<u8, <CipherSuite as TlsCipherSuite>::IvLen>;
+pub type KeyArray<CipherSuite> = Array<u8, <CipherSuite as TlsCipherSuite>::KeyLen>;
+pub type HashArray<CipherSuite> = Array<u8, HashOutputSize<CipherSuite>>;
 
-type Hkdf<CipherSuite> = hkdf::Hkdf<
-    <CipherSuite as TlsCipherSuite>::Hash,
-    SimpleHmac<<CipherSuite as TlsCipherSuite>::Hash>,
->;
+type Hkdf<CipherSuite> = hkdf::GenericHkdf<SimpleHmac<<CipherSuite as TlsCipherSuite>::Hash>>;
 
 enum Secret<CipherSuite>
 where
@@ -42,11 +38,11 @@ where
         }
     }
 
-    fn make_expanded_hkdf_label<N: ArrayLength<u8>>(
+    fn make_expanded_hkdf_label<N: ArraySize>(
         &self,
         label: &[u8],
         context_type: ContextType<CipherSuite>,
-    ) -> Result<GenericArray<u8, N>, TlsError> {
+    ) -> Result<Array<u8, N>, TlsError> {
         //info!("make label {:?} {}", label, len);
         // Max label buffer: hash_output (up to 48 for SHA-384) + 12 (longest label) + 10 (overhead) = 70
         let mut hkdf_label = heapless::Vec::<u8, 70>::new();
@@ -79,7 +75,7 @@ where
             }
         }
 
-        let mut okm = GenericArray::default();
+        let mut okm = Array::default();
         //info!("label {:x?}", label);
         self.as_ref()?
             .expand(&hkdf_label, &mut okm)
@@ -103,7 +99,7 @@ where
 {
     fn new() -> Self {
         Self {
-            secret: GenericArray::default(),
+            secret: Array::default(),
             hkdf: Secret::Uninitialized,
         }
     }
@@ -300,7 +296,7 @@ where
         //info!("counter = {:x?}", counter);
         // info!("iv = {:x?}", iv);
 
-        let mut nonce = GenericArray::default();
+        let mut nonce = Array::default();
 
         for (index, (l, r)) in iv[0..CipherSuite::IvLen::to_usize()]
             .iter()
@@ -315,9 +311,9 @@ where
         nonce
     }
 
-    fn pad<N: ArrayLength<u8>>(input: &[u8]) -> GenericArray<u8, N> {
+    fn pad<N: ArraySize>(input: &[u8]) -> Array<u8, N> {
         // info!("padding input = {:x?}", input);
-        let mut padded = GenericArray::default();
+        let mut padded = Array::default();
         for (index, byte) in input.iter().rev().enumerate() {
             /*info!(
                 "{} pad {}={:x?}",
@@ -331,7 +327,7 @@ where
     }
 
     fn zero() -> HashArray<CipherSuite> {
-        GenericArray::default()
+        Array::default()
     }
 
     // Initializes the early secrets with a callback for any PSK binders

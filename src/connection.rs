@@ -17,13 +17,13 @@ use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
 
 use crate::application_data::ApplicationData;
 use crate::buffer::CryptoBuffer;
-use digest::generic_array::typenum::Unsigned;
+use hybrid_array::typenum::Unsigned;
 use p256::ecdh::EphemeralSecret;
 use signature::SignerMut;
 
 use crate::content_types::ContentType;
 use crate::parse_buffer::ParseBuffer;
-use aes_gcm::aead::{AeadCore, AeadInPlace, KeyInit};
+use aes_gcm::aead::{AeadCore, AeadInOut, KeyInit};
 
 /// Decrypts a protected record and passes each message in it to `cb`. Every caller runs after
 /// the handshake keys are installed, so an unprotected record is refused unless it is a
@@ -726,7 +726,9 @@ mod tests {
     use crate::config::{Aes128GcmSha256, CertificateVerifyRef, TlsVerifier};
     use crate::handshake::HandshakeType;
     use crate::handshake::server_hello::ServerHello;
-    use rand::rngs::OsRng;
+    use getrandom::SysRng;
+    use p256::elliptic_curve::Generate;
+    use rand_core::UnwrapErr;
 
     type Suite = Aes128GcmSha256;
     type Cipher = <Suite as TlsCipherSuite>::Cipher;
@@ -740,8 +742,8 @@ mod tests {
         type CipherSuite = Suite;
         type Signature = p256::ecdsa::DerSignature;
 
-        fn rng(&mut self) -> impl crate::CryptoRngCore {
-            OsRng
+        fn rng(&mut self) -> impl crate::CryptoRng {
+            UnwrapErr(SysRng)
         }
 
         fn verifier(&mut self) -> Result<&mut impl TlsVerifier<Suite>, TlsError> {
@@ -921,7 +923,9 @@ mod tests {
     /// A `ServerHello` with a P-256 key share from a fresh key, and with a `pre_shared_key`
     /// extension that selects the identity `psk` when it is set.
     fn server_hello(psk: Option<u16>) -> std::vec::Vec<u8> {
-        let key = p256::EncodedPoint::from(EphemeralSecret::random(&mut OsRng).public_key());
+        let key = p256::Sec1Point::from(
+            EphemeralSecret::generate_from_rng(&mut UnwrapErr(SysRng)).public_key(),
+        );
         let key = key.as_bytes();
         let mut extensions = std::vec::Vec::new();
         extensions.extend_from_slice(&[0x00, 0x33]);
@@ -942,7 +946,7 @@ mod tests {
     }
 
     fn process_hello(handshake: &mut Handshake<Suite>, bytes: &[u8]) -> Result<State, TlsError> {
-        handshake.secret = Some(EphemeralSecret::random(&mut OsRng));
+        handshake.secret = Some(EphemeralSecret::generate_from_rng(&mut UnwrapErr(SysRng)));
         let hello = ServerHello::parse(&mut ParseBuffer::new(bytes)).unwrap();
         let mut key_schedule = KeySchedule::new();
         key_schedule.initialize_early_secret(None).unwrap();
@@ -1009,8 +1013,8 @@ mod tests {
         type CipherSuite = Suite;
         type Signature = p256::ecdsa::DerSignature;
 
-        fn rng(&mut self) -> impl crate::CryptoRngCore {
-            OsRng
+        fn rng(&mut self) -> impl crate::CryptoRng {
+            UnwrapErr(SysRng)
         }
     }
 
@@ -1051,7 +1055,7 @@ mod tests {
     #[test]
     fn certificate_then_certificate_verify_then_finished_is_accepted_by_unsecure_provider() {
         let (mut handshake, mut key_schedule) = after_server_hello();
-        let mut provider = UnsecureProvider::new::<Suite>(OsRng);
+        let mut provider = UnsecureProvider::new::<Suite>(UnwrapErr(SysRng));
         for message in [certificate(), certificate_verify()] {
             let result = verify_with(&mut handshake, &mut key_schedule, &mut provider, &message);
             assert!(matches!(result, Ok(State::ServerVerify)), "{result:?}");
@@ -1172,7 +1176,7 @@ mod tests {
         let (header, data) = bytes.split_at_mut(crate::record::RecordHeader::LEN);
         let crypto = <Cipher as KeyInit>::new(read.get_key()?);
         let tag = crypto
-            .encrypt_in_place_detached(&read.get_nonce()?, header, data)
+            .encrypt_inout_detached(&read.get_nonce()?, header, data.into())
             .map_err(|_| TlsError::CryptoError)?;
         bytes.extend_from_slice(&tag);
         Ok(bytes)

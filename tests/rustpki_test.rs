@@ -3,9 +3,10 @@
 use embedded_io_adapters::tokio_1::FromTokio;
 use embedded_tls::pki::CertVerifier;
 use embedded_tls::{Aes128GcmSha256, CryptoProvider, SignatureScheme, TlsError, TlsVerifier};
+use getrandom::SysRng;
 use p256::SecretKey;
 use p256::ecdsa::{DerSignature, SigningKey};
-use rand_core::OsRng;
+use rand_core::UnwrapErr;
 use rustls::server::AllowAnyAnonymousOrAuthenticatedClient;
 use signature::SignerMut;
 use std::net::SocketAddr;
@@ -19,7 +20,7 @@ static INIT: Once = Once::new();
 static mut ADDR: Option<SocketAddr> = None;
 
 struct RustPkiProvider<'a> {
-    rng: rand::rngs::OsRng,
+    rng: UnwrapErr<SysRng>,
     verifier: CertVerifier<'a, Aes128GcmSha256, SystemTime, 4096>,
     priv_key: Option<&'a [u8]>,
     client_cert: Option<embedded_tls::Certificate<&'a [u8]>>,
@@ -43,7 +44,7 @@ impl CryptoProvider for RustPkiProvider<'_> {
             SecretKey::from_sec1_der(key_der).map_err(|_| TlsError::InvalidPrivateKey)?;
 
         Ok((
-            SigningKey::from(&secret_key),
+            embedded_tls::SignerRef(SigningKey::from(&secret_key)),
             SignatureScheme::EcdsaSecp256r1Sha256,
         ))
     }
@@ -134,7 +135,7 @@ async fn test_server_certificate_validation() {
     let open_fut = tls.open(TlsContext::new(
         &config,
         RustPkiProvider {
-            rng: OsRng,
+            rng: UnwrapErr(SysRng),
             verifier: CertVerifier::new(Certificate::X509(&der[..])),
             priv_key: None,
             client_cert: None,
@@ -181,7 +182,7 @@ async fn test_mutual_certificate_validation() {
     let open_fut = tls.open(TlsContext::new(
         &config,
         RustPkiProvider {
-            rng: OsRng,
+            rng: UnwrapErr(SysRng),
             verifier: CertVerifier::new(Certificate::X509(&ca_der[..])),
             priv_key: Some(&key_der),
             client_cert: Some(Certificate::X509(&cli_der[..])),

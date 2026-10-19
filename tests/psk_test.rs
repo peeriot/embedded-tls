@@ -1,8 +1,9 @@
 #![macro_use]
 use embedded_io_adapters::tokio_1::FromTokio;
 use embedded_tls::*;
+use getrandom::SysRng;
 use openssl::ssl;
-use rand::rngs::OsRng;
+use rand_core::UnwrapErr;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::net::TcpListener;
@@ -84,7 +85,7 @@ async fn test_psk_open() {
         assert!(
             tls.open(TlsContext::new(
                 &config,
-                UnsecureProvider::new::<Aes128GcmSha256>(OsRng)
+                UnsecureProvider::new::<Aes128GcmSha256>(UnwrapErr(SysRng))
             ))
             .await
             .is_ok()

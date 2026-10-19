@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A decrypted record whose plaintext has no non-zero octet (for example a record with only the authentication tag) is now refused with `InvalidRecord` instead of panicking.
 - Once the handshake keys are installed, an unprotected record other than `change_cipher_spec` is refused with `InvalidRecord`. A plaintext `close_notify` no longer closes the connection, and a plaintext handshake message no longer reaches the handshake or panics the reader. A protected handshake message other than `NewSessionTicket` after the handshake is refused with `InvalidHandshake` instead of panicking.
 - A server `CertificateRequest` after the server's `Certificate`, or after the server selected a pre-shared key, is refused with `InvalidHandshake`; the client no longer sends its certificate in a PSK handshake. A server `Certificate` with an empty certificate list is refused with a `decode_error` alert before the verifier sees it.
+- Move to the RustCrypto generation of p256 0.14, ecdsa 0.17, signature 3, digest 0.11, sha2 0.11, hmac 0.13, hkdf 0.13, aes-gcm 0.11, rand_core 0.10 and hybrid-array (p384 0.14, ed25519-dalek 3 and rsa 0.10 behind their features). `CryptoProvider::rng` returns a rand_core 0.10 `CryptoRng`; `CryptoRngCore` stays as its alias. `CryptoProvider::signer` returns a signature 3 `SignerMut`, which a `Signer` such as `p256::ecdsa::SigningKey` no longer implements: wrap it in the new `SignerRef`. Signing stays deterministic (RFC 6979).
 
 ## 0.19.0
 

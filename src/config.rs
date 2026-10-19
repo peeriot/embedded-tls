@@ -6,14 +6,14 @@ use crate::extensions::extension_data::signature_algorithms::SignatureScheme;
 use crate::extensions::extension_data::supported_groups::NamedGroup;
 pub use crate::handshake::certificate::{CertificateEntryRef, CertificateRef};
 pub use crate::handshake::certificate_verify::CertificateVerifyRef;
-use aes_gcm::{AeadInPlace, Aes128Gcm, Aes256Gcm, KeyInit};
-use digest::core_api::BlockSizeUser;
+use aes_gcm::{AeadInOut, Aes128Gcm, Aes256Gcm, KeyInit};
+use digest::block_api::BlockSizeUser;
 use digest::{Digest, FixedOutput, OutputSizeUser, Reset};
 use ecdsa::elliptic_curve::SecretKey;
-use generic_array::ArrayLength;
 use heapless::Vec;
+use hybrid_array::ArraySize;
 use p256::ecdsa::SigningKey;
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 pub use sha2::{Sha256, Sha384};
 use typenum::{Sum, U10, U12, U16, U32};
 
@@ -32,12 +32,12 @@ type LabelBuffer<CipherSuite> = Sum<
 /// Represents a TLS 1.3 cipher suite
 pub trait TlsCipherSuite {
     const CODE_POINT: u16;
-    type Cipher: KeyInit<KeySize = Self::KeyLen> + AeadInPlace<NonceSize = Self::IvLen>;
-    type KeyLen: ArrayLength<u8>;
-    type IvLen: ArrayLength<u8>;
+    type Cipher: KeyInit<KeySize = Self::KeyLen> + AeadInOut<NonceSize = Self::IvLen>;
+    type KeyLen: ArraySize;
+    type IvLen: ArraySize;
 
     type Hash: Digest + Reset + Clone + OutputSizeUser + BlockSizeUser + FixedOutput;
-    type LabelBufferSize: ArrayLength<u8>;
+    type LabelBufferSize: ArraySize;
 }
 
 pub struct Aes128GcmSha256;
@@ -147,7 +147,7 @@ pub trait CryptoProvider {
     type CipherSuite: TlsCipherSuite;
     type Signature: AsRef<[u8]>;
 
-    fn rng(&mut self) -> impl CryptoRngCore;
+    fn rng(&mut self) -> impl CryptoRng;
 
     /// Provide the verifier for the server's `Certificate` and `CertificateVerify`.
     ///
@@ -185,7 +185,7 @@ impl<T: CryptoProvider> CryptoProvider for &mut T {
 
     type Signature = T::Signature;
 
-    fn rng(&mut self) -> impl CryptoRngCore {
+    fn rng(&mut self) -> impl CryptoRng {
         T::rng(self)
     }
 
@@ -207,9 +207,20 @@ impl<T: CryptoProvider> CryptoProvider for &mut T {
 
 pub struct NoSign;
 
-impl<S> signature::Signer<S> for NoSign {
-    fn try_sign(&self, _msg: &[u8]) -> Result<S, signature::Error> {
+impl<S> signature::SignerMut<S> for NoSign {
+    fn try_sign(&mut self, _msg: &[u8]) -> Result<S, signature::Error> {
         unimplemented!()
+    }
+}
+
+/// Adapts a [`signature::Signer`], such as a `p256::ecdsa::SigningKey`, to the
+/// [`signature::SignerMut`] that [`CryptoProvider::signer`] returns. signature 3 no longer
+/// implements `SignerMut` for every `Signer`.
+pub struct SignerRef<T>(pub T);
+
+impl<S, T: signature::Signer<S>> signature::SignerMut<S> for SignerRef<T> {
+    fn try_sign(&mut self, msg: &[u8]) -> Result<S, signature::Error> {
+        self.0.try_sign(msg)
     }
 }
 
@@ -226,7 +237,7 @@ pub struct UnsecureProvider<'a, CipherSuite, RNG> {
     _marker: PhantomData<CipherSuite>,
 }
 
-impl<RNG: CryptoRngCore> UnsecureProvider<'_, (), RNG> {
+impl<RNG: CryptoRng> UnsecureProvider<'_, (), RNG> {
     pub fn new<CipherSuite: TlsCipherSuite>(
         rng: RNG,
     ) -> UnsecureProvider<'static, CipherSuite, RNG> {
@@ -240,7 +251,7 @@ impl<RNG: CryptoRngCore> UnsecureProvider<'_, (), RNG> {
     }
 }
 
-impl<'a, CipherSuite: TlsCipherSuite, RNG: CryptoRngCore> UnsecureProvider<'a, CipherSuite, RNG> {
+impl<'a, CipherSuite: TlsCipherSuite, RNG: CryptoRng> UnsecureProvider<'a, CipherSuite, RNG> {
     pub fn with_priv_key(mut self, priv_key: &'a [u8]) -> Self {
         self.priv_key = Some(priv_key);
         self
@@ -252,13 +263,13 @@ impl<'a, CipherSuite: TlsCipherSuite, RNG: CryptoRngCore> UnsecureProvider<'a, C
     }
 }
 
-impl<CipherSuite: TlsCipherSuite, RNG: CryptoRngCore> CryptoProvider
+impl<CipherSuite: TlsCipherSuite, RNG: CryptoRng> CryptoProvider
     for UnsecureProvider<'_, CipherSuite, RNG>
 {
     type CipherSuite = CipherSuite;
     type Signature = p256::ecdsa::DerSignature;
 
-    fn rng(&mut self) -> impl CryptoRngCore {
+    fn rng(&mut self) -> impl CryptoRng {
         &mut self.rng
     }
 
@@ -275,7 +286,7 @@ impl<CipherSuite: TlsCipherSuite, RNG: CryptoRngCore> CryptoProvider
             SecretKey::from_sec1_der(key_der).map_err(|_| TlsError::InvalidPrivateKey)?;
 
         Ok((
-            SigningKey::from(&secret_key),
+            SignerRef(SigningKey::from(&secret_key)),
             SignatureScheme::EcdsaSecp256r1Sha256,
         ))
     }
