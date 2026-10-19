@@ -57,7 +57,12 @@ impl DecryptedReadHandler<'_> {
                 Ok(())
             }
             ServerRecord::Handshake(_) => {
-                unimplemented!()
+                // After the handshake a server may only send NewSessionTicket, KeyUpdate and,
+                // if the client offered post_handshake_auth, CertificateRequest (RFC 8446,
+                // Section 4.6). The client offers no post_handshake_auth, and KeyUpdate does not
+                // parse into a `ServerHandshake`. Any other message is a protocol error, and the
+                // connection fails instead of panicking.
+                Err(TlsError::InvalidHandshake)
             }
         }
     }
