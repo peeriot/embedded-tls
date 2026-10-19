@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Fix the client accepting a server `Finished` without server authentication (#215). The client now requires a verified `Certificate` and `CertificateVerify`, in that order, or a pre-shared key it offered.
 - A `CryptoProvider` that does not override `verifier()` now refuses a server `Certificate` instead of skipping its verification. `UnsecureProvider` returns `NoVerify` explicitly and keeps working; a custom provider that should skip verification must return `NoVerify` from `verifier()`.
+- A decrypted record whose plaintext has no non-zero octet (for example a record with only the authentication tag) is now refused with `InvalidRecord` instead of panicking.
 
 ## 0.19.0
 
