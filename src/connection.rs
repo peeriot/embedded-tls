@@ -27,6 +27,9 @@ use ml_kem::{DecapsulationKey, MlKem768};
 use crate::content_types::ContentType;
 use crate::parse_buffer::ParseBuffer;
 
+/// Decrypts a protected record and passes each message in it to `cb`. Every caller runs after
+/// the handshake keys are installed, so an unprotected record is refused unless it is a
+/// `ChangeCipherSpec`.
 pub(crate) fn decrypt_record<CipherSuite>(
     key_schedule: &mut ReadKeySchedule<CipherSuite>,
     record: ServerRecord<'_, CipherSuite>,
@@ -92,9 +95,20 @@ where
             _ => return Err(TlsError::Unimplemented),
         }
         key_schedule.increment_counter();
-    } else {
+    } else if let ServerRecord::ChangeCipherSpec(_) = record {
+        // A server in middlebox compatibility mode may send an unprotected change_cipher_spec
+        // record before its Finished (RFC 8446, Section 5 and Appendix D.4).
         trace!("Not decrypting: content_type = {:?}", record.content_type());
         cb(key_schedule, record)?;
+    } else {
+        // Once the handshake keys are installed, every other record is protected (RFC 8446,
+        // Section 5). An unprotected Handshake or Alert record can come from anyone on the path,
+        // so it is refused, and a forged close_notify cannot end the connection (Section 6.1).
+        warn!(
+            "Unprotected record after the handshake keys: content_type = {:?}",
+            record.content_type()
+        );
+        return Err(TlsError::InvalidRecord);
     }
     Ok(())
 }
@@ -675,8 +689,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SignatureScheme;
-    use crate::config::{Aes128GcmSha256, CertificateVerifyRef, InsecureNoVerify};
+    use crate::common::decrypted_buffer_info::DecryptedBufferInfo;
+    use crate::common::decrypted_read_handler::DecryptedReadHandler;
+    use crate::config::{Aes128GcmSha256, InsecureNoVerify};
+    use crate::handshake::HandshakeType;
     #[cfg(not(any(feature = "x25519", feature = "mlkem")))]
     use crate::handshake::server_hello::ServerHello;
 
@@ -692,7 +708,15 @@ mod tests {
         (Handshake::new(), key_schedule)
     }
 
-    fn finished(key_schedule: &mut KeySchedule<Suite>) -> ServerRecord<'static, Suite> {
+    /// The bytes of a handshake message: its type, its length, then `body`.
+    fn handshake_message(handshake_type: HandshakeType, body: &[u8]) -> std::vec::Vec<u8> {
+        let mut message = std::vec![handshake_type as u8];
+        message.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        message.extend_from_slice(body);
+        message
+    }
+
+    fn finished(key_schedule: &mut KeySchedule<Suite>) -> std::vec::Vec<u8> {
         let finished = key_schedule.read_state().server_finished().unwrap();
         assert!(
             key_schedule
@@ -700,34 +724,42 @@ mod tests {
                 .verify_server_finished(&finished)
                 .unwrap()
         );
-        ServerRecord::Handshake(ServerHandshake::Finished(finished))
+        handshake_message(HandshakeType::Finished, finished.verify.as_ref())
     }
 
-    fn certificate() -> ServerRecord<'static, Suite> {
-        ServerRecord::Handshake(ServerHandshake::Certificate(CertificateRef::with_context(
-            &[],
-        )))
+    /// A `Certificate` with no request context and no certificates.
+    fn certificate() -> std::vec::Vec<u8> {
+        handshake_message(HandshakeType::Certificate, &[0, 0, 0, 0])
     }
 
-    /// A `CertificateVerify` with a made-up signature. `InsecureNoVerify` accepts any signature, so
-    /// the tests that use it check only the order of the messages.
-    fn certificate_verify() -> ServerRecord<'static, Suite> {
-        ServerRecord::Handshake(ServerHandshake::CertificateVerify(CertificateVerifyRef {
-            signature_scheme: SignatureScheme::EcdsaSecp256r1Sha256,
-            signature: &[1; 64],
-        }))
+    /// A `CertificateVerify` with a made-up `ecdsa_secp256r1_sha256` signature.
+    fn certificate_verify() -> std::vec::Vec<u8> {
+        let mut body = std::vec![0x04, 0x03, 0, 64];
+        body.extend_from_slice(&[1; 64]);
+        handshake_message(HandshakeType::CertificateVerify, &body)
+    }
+
+    /// Seals `message` in a record with the server's handshake traffic key, as the server does,
+    /// and passes the record to `process_server_verify`. `InsecureNoVerify` accepts any
+    /// certificate and any signature, so the tests that use it check only the order of the
+    /// messages.
+    fn verify(
+        handshake: &mut Handshake<Suite>,
+        key_schedule: &mut KeySchedule<Suite>,
+        message: &[u8],
+    ) -> Result<State, TlsError> {
+        let mut plaintext = message.to_vec();
+        plaintext.push(ContentType::Handshake as u8);
+        let mut bytes = sealed_record_bytes(key_schedule.read_state(), &plaintext)?;
+        let record = parse_record(key_schedule.read_state(), &mut bytes)?;
+        process_server_verify(handshake, key_schedule, &mut InsecureNoVerify, record)
     }
 
     #[test]
     fn finished_without_a_certificate_is_refused() {
         let (mut handshake, mut key_schedule) = after_server_hello();
-        let record = finished(&mut key_schedule);
-        let result = process_server_verify(
-            &mut handshake,
-            &mut key_schedule,
-            &mut InsecureNoVerify,
-            record,
-        );
+        let message = finished(&mut key_schedule);
+        let result = verify(&mut handshake, &mut key_schedule, &message);
         assert!(
             matches!(result, Err(TlsError::InvalidHandshake)),
             "{result:?}"
@@ -737,22 +769,12 @@ mod tests {
     #[test]
     fn certificate_then_certificate_verify_then_finished_is_accepted() {
         let (mut handshake, mut key_schedule) = after_server_hello();
-        for record in [certificate(), certificate_verify()] {
-            let result = process_server_verify(
-                &mut handshake,
-                &mut key_schedule,
-                &mut InsecureNoVerify,
-                record,
-            );
+        for message in [certificate(), certificate_verify()] {
+            let result = verify(&mut handshake, &mut key_schedule, &message);
             assert!(matches!(result, Ok(State::ServerVerify)), "{result:?}");
         }
-        let record = finished(&mut key_schedule);
-        let result = process_server_verify(
-            &mut handshake,
-            &mut key_schedule,
-            &mut InsecureNoVerify,
-            record,
-        );
+        let message = finished(&mut key_schedule);
+        let result = verify(&mut handshake, &mut key_schedule, &message);
         assert!(matches!(result, Ok(State::ClientFinished)), "{result:?}");
     }
 
@@ -760,12 +782,7 @@ mod tests {
     fn a_certificate_after_a_selected_psk_is_refused() {
         let (mut handshake, mut key_schedule) = after_server_hello();
         handshake.server_auth = ServerAuth::Psk;
-        let result = process_server_verify(
-            &mut handshake,
-            &mut key_schedule,
-            &mut InsecureNoVerify,
-            certificate(),
-        );
+        let result = verify(&mut handshake, &mut key_schedule, &certificate());
         assert!(
             matches!(result, Err(TlsError::InvalidHandshake)),
             "{result:?}"
@@ -776,13 +793,8 @@ mod tests {
     fn finished_after_a_verified_signature_is_accepted() {
         let (mut handshake, mut key_schedule) = after_server_hello();
         handshake.server_auth = ServerAuth::Signed;
-        let record = finished(&mut key_schedule);
-        let result = process_server_verify(
-            &mut handshake,
-            &mut key_schedule,
-            &mut InsecureNoVerify,
-            record,
-        );
+        let message = finished(&mut key_schedule);
+        let result = verify(&mut handshake, &mut key_schedule, &message);
         assert!(matches!(result, Ok(State::ClientFinished)), "{result:?}");
     }
 
@@ -790,13 +802,8 @@ mod tests {
     fn finished_after_a_selected_psk_is_accepted() {
         let (mut handshake, mut key_schedule) = after_server_hello();
         handshake.server_auth = ServerAuth::Psk;
-        let record = finished(&mut key_schedule);
-        let result = process_server_verify(
-            &mut handshake,
-            &mut key_schedule,
-            &mut InsecureNoVerify,
-            record,
-        );
+        let message = finished(&mut key_schedule);
+        let result = verify(&mut handshake, &mut key_schedule, &message);
         assert!(matches!(result, Ok(State::ClientFinished)), "{result:?}");
     }
 
@@ -804,13 +811,8 @@ mod tests {
     fn finished_after_a_certificate_without_its_signature_is_refused() {
         let (mut handshake, mut key_schedule) = after_server_hello();
         handshake.server_auth = ServerAuth::Certificate;
-        let record = finished(&mut key_schedule);
-        let result = process_server_verify(
-            &mut handshake,
-            &mut key_schedule,
-            &mut InsecureNoVerify,
-            record,
-        );
+        let message = finished(&mut key_schedule);
+        let result = verify(&mut handshake, &mut key_schedule, &message);
         assert!(
             matches!(result, Err(TlsError::InvalidHandshake)),
             "{result:?}"
@@ -821,12 +823,7 @@ mod tests {
     fn certificate_verify_after_a_certificate_authenticates_the_server() {
         let (mut handshake, mut key_schedule) = after_server_hello();
         handshake.server_auth = ServerAuth::Certificate;
-        let result = process_server_verify(
-            &mut handshake,
-            &mut key_schedule,
-            &mut InsecureNoVerify,
-            certificate_verify(),
-        );
+        let result = verify(&mut handshake, &mut key_schedule, &certificate_verify());
         assert!(matches!(result, Ok(State::ServerVerify)), "{result:?}");
         assert_eq!(handshake.server_auth, ServerAuth::Signed);
     }
@@ -917,16 +914,48 @@ mod tests {
     #[test]
     fn certificate_verify_without_a_certificate_is_refused() {
         let (mut handshake, mut key_schedule) = after_server_hello();
-        let result = process_server_verify(
-            &mut handshake,
-            &mut key_schedule,
-            &mut InsecureNoVerify,
-            certificate_verify(),
-        );
+        let result = verify(&mut handshake, &mut key_schedule, &certificate_verify());
         assert!(
             matches!(result, Err(TlsError::InvalidHandshake)),
             "{result:?}"
         );
+    }
+
+    /// The bytes of a record: its header, then `fragment`.
+    fn record_bytes(content_type: ContentType, fragment: &[u8]) -> std::vec::Vec<u8> {
+        let mut bytes = std::vec![content_type as u8, 0x03, 0x03];
+        bytes.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(fragment);
+        bytes
+    }
+
+    /// The bytes of a protected record that holds `plaintext` (the content, its content type,
+    /// then any zero padding), sealed with the server's handshake traffic key, as a peer that
+    /// knows the handshake secret can.
+    fn sealed_record_bytes(
+        read: &mut ReadKeySchedule<Suite>,
+        plaintext: &[u8],
+    ) -> Result<std::vec::Vec<u8>, TlsError> {
+        let mut bytes = record_bytes(ContentType::ApplicationData, plaintext);
+        let len = ((plaintext.len() + TAG_LEN) as u16).to_be_bytes();
+        bytes[3..5].copy_from_slice(&len);
+        let (header, data) = bytes.split_at_mut(crate::record::RecordHeader::LEN);
+        let crypto = <Cipher as TlsAead>::new(read.get_key()?);
+        let tag = <Cipher as TlsAead>::encrypt(&crypto, &read.get_nonce()?, header, data)?;
+        bytes.extend_from_slice(&tag);
+        Ok(bytes)
+    }
+
+    /// Parses the record in `bytes`, as the record reader does.
+    fn parse_record<'a>(
+        read: &mut ReadKeySchedule<Suite>,
+        bytes: &'a mut [u8],
+    ) -> Result<ServerRecord<'a, Suite>, TlsError> {
+        let (header, data) = bytes.split_at_mut(crate::record::RecordHeader::LEN);
+        let header = crate::record::RecordHeader::decode(
+            (&*header).try_into().map_err(|_| TlsError::InvalidRecord)?,
+        )?;
+        ServerRecord::decode(header, data, read.transcript_hash())
     }
 
     /// Seals `plaintext` (the content, its content type, then any zero padding) with the server's
@@ -937,24 +966,8 @@ mod tests {
     ) -> Result<std::vec::Vec<(ContentType, std::vec::Vec<u8>)>, TlsError> {
         let (_, mut key_schedule) = after_server_hello();
         let read = key_schedule.read_state();
-        let len = ((plaintext.len() + TAG_LEN) as u16).to_be_bytes();
-        let header = [
-            ContentType::ApplicationData as u8,
-            0x03,
-            0x03,
-            len[0],
-            len[1],
-        ];
-        let crypto = <Cipher as TlsAead>::new(read.get_key()?);
-        let mut data = plaintext.to_vec();
-        let tag = <Cipher as TlsAead>::encrypt(&crypto, &read.get_nonce()?, &header, &mut data)?;
-        data.extend_from_slice(&tag);
-
-        let len = data.len();
-        let record = ServerRecord::ApplicationData(ApplicationData::new(
-            CryptoBuffer::wrap_with_pos(&mut data, len),
-            crate::record::RecordHeader::decode(header)?,
-        ));
+        let mut bytes = sealed_record_bytes(read, plaintext)?;
+        let record = parse_record(read, &mut bytes)?;
         let mut records = std::vec::Vec::new();
         decrypt_record(read, record, |_, record| {
             let content = match &record {
@@ -995,5 +1008,105 @@ mod tests {
             matches!(records, Err(TlsError::InvalidRecord)),
             "{records:?}"
         );
+    }
+
+    const CLOSE_NOTIFY: [u8; 2] = [
+        AlertLevel::Warning as u8,
+        AlertDescription::CloseNotify as u8,
+    ];
+
+    /// Reads one record with `content_type` and `content` the way a connection reads application
+    /// data, and returns the result and whether the connection is still open. The record is
+    /// sealed with the read key when `protected` is set, and sent in the clear otherwise. Which
+    /// traffic key is installed does not matter to `decrypt_record` or the handler.
+    fn read_application_data(
+        protected: bool,
+        content_type: ContentType,
+        content: &[u8],
+    ) -> (Result<(), TlsError>, bool) {
+        let (_, mut key_schedule) = after_server_hello();
+        let read = key_schedule.read_state();
+        let mut bytes = if protected {
+            let mut plaintext = content.to_vec();
+            plaintext.push(content_type as u8);
+            sealed_record_bytes(read, &plaintext).unwrap()
+        } else {
+            record_bytes(content_type, content)
+        };
+        let source_buffer = bytes.as_ptr_range();
+        let record = parse_record(read, &mut bytes).unwrap();
+        let mut buffer_info = DecryptedBufferInfo::default();
+        let mut is_open = true;
+        let mut handler = DecryptedReadHandler {
+            source_buffer,
+            buffer_info: &mut buffer_info,
+            is_open: &mut is_open,
+        };
+        let result = decrypt_record(read, record, |_, record| handler.handle(record));
+        (result, is_open)
+    }
+
+    #[test]
+    fn a_protected_close_notify_closes_the_connection() {
+        let (result, is_open) = read_application_data(true, ContentType::Alert, &CLOSE_NOTIFY);
+        assert!(
+            matches!(result, Err(TlsError::ConnectionClosed)),
+            "{result:?}"
+        );
+        assert!(!is_open);
+    }
+
+    #[test]
+    fn a_plaintext_close_notify_is_refused_and_leaves_the_connection_open() {
+        let (result, is_open) = read_application_data(false, ContentType::Alert, &CLOSE_NOTIFY);
+        assert!(matches!(result, Err(TlsError::InvalidRecord)), "{result:?}");
+        assert!(is_open);
+    }
+
+    #[test]
+    fn a_plaintext_handshake_message_after_the_handshake_is_refused() {
+        let (result, is_open) =
+            read_application_data(false, ContentType::Handshake, &certificate());
+        assert!(matches!(result, Err(TlsError::InvalidRecord)), "{result:?}");
+        assert!(is_open);
+    }
+
+    #[test]
+    fn a_protected_certificate_after_the_handshake_is_refused() {
+        let (result, _) = read_application_data(true, ContentType::Handshake, &certificate());
+        assert!(
+            matches!(result, Err(TlsError::InvalidHandshake)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_plaintext_certificate_during_the_handshake_is_refused() {
+        let (mut handshake, mut key_schedule) = after_server_hello();
+        let mut bytes = record_bytes(ContentType::Handshake, &certificate());
+        let record = parse_record(key_schedule.read_state(), &mut bytes).unwrap();
+        let result = process_server_verify(
+            &mut handshake,
+            &mut key_schedule,
+            &mut InsecureNoVerify,
+            record,
+        );
+        assert!(matches!(result, Err(TlsError::InvalidRecord)), "{result:?}");
+        assert_eq!(handshake.server_auth, ServerAuth::None);
+    }
+
+    #[test]
+    fn a_plaintext_change_cipher_spec_during_the_handshake_is_dropped() {
+        let (mut handshake, mut key_schedule) = after_server_hello();
+        let mut bytes = record_bytes(ContentType::ChangeCipherSpec, &[1]);
+        let record = parse_record(key_schedule.read_state(), &mut bytes).unwrap();
+        let result = process_server_verify(
+            &mut handshake,
+            &mut key_schedule,
+            &mut InsecureNoVerify,
+            record,
+        );
+        assert!(matches!(result, Ok(State::ServerVerify)), "{result:?}");
+        assert_eq!(handshake.server_auth, ServerAuth::None);
     }
 }
