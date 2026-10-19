@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `CryptoProvider` that does not override `verifier()` now refuses a server `Certificate` instead of skipping its verification. `UnsecureProvider` returns `NoVerify` explicitly and keeps working; a custom provider that should skip verification must return `NoVerify` from `verifier()`.
 - A decrypted record whose plaintext has no non-zero octet (for example a record with only the authentication tag) is now refused with `InvalidRecord` instead of panicking.
 - Once the handshake keys are installed, an unprotected record other than `change_cipher_spec` is refused with `InvalidRecord`. A plaintext `close_notify` no longer closes the connection, and a plaintext handshake message no longer reaches the handshake or panics the reader. A protected handshake message other than `NewSessionTicket` after the handshake is refused with `InvalidHandshake` instead of panicking.
+- A server `CertificateRequest` after the server's `Certificate`, or after the server selected a pre-shared key, is refused with `InvalidHandshake`; the client no longer sends its certificate in a PSK handshake. A server `Certificate` with an empty certificate list is refused with a `decode_error` alert before the verifier sees it.
 
 ## 0.19.0
 

@@ -498,6 +498,17 @@ where
                         }
                         // (RFC 8446, Section 4.4.2.4)
                         //
+                        // A server that authenticates with a certificate must send one. An
+                        // empty certificate_list is refused with decode_error before the
+                        // verifier sees it, so no verifier can take it as authentication.
+                        if certificate.entries.is_empty() {
+                            warn!("Certificate refused: the certificate_list is empty");
+                            return Err(TlsError::AbortHandshake(
+                                AlertLevel::Fatal,
+                                AlertDescription::DecodeError,
+                            ));
+                        }
+                        //
                         // The client must verify the server's certificate, so a provider
                         // without a verifier cannot accept one. `NoVerify` skips the check
                         // only when the provider returns it explicitly.
@@ -526,6 +537,15 @@ where
                         handshake.server_auth = ServerAuth::Signed;
                     }
                     ServerHandshake::CertificateRequest(request) => {
+                        // (RFC 8446, Section 4.3.2)
+                        //
+                        // A CertificateRequest comes right after EncryptedExtensions, before
+                        // the server's Certificate, and a server that authenticates with a
+                        // pre-shared key must not send one.
+                        if handshake.server_auth != ServerAuth::None {
+                            warn!("CertificateRequest refused: the server already authenticated");
+                            return Err(TlsError::InvalidHandshake);
+                        }
                         handshake.certificate_request.replace(request.try_into()?);
                     }
                     ServerHandshake::Finished(finished) => {
@@ -775,9 +795,22 @@ mod tests {
         handshake_message(HandshakeType::Finished, finished.verify.as_ref())
     }
 
-    /// A `Certificate` with no request context and no certificates.
+    /// A `Certificate` with no request context and one made-up certificate entry.
     fn certificate() -> std::vec::Vec<u8> {
+        handshake_message(
+            HandshakeType::Certificate,
+            &[0, 0, 0, 7, 0, 0, 2, 0x30, 0x00, 0, 0],
+        )
+    }
+
+    /// A `Certificate` with no request context and an empty `certificate_list`.
+    fn empty_certificate() -> std::vec::Vec<u8> {
         handshake_message(HandshakeType::Certificate, &[0, 0, 0, 0])
+    }
+
+    /// A `CertificateRequest` with no request context and no extensions.
+    fn certificate_request() -> std::vec::Vec<u8> {
+        handshake_message(HandshakeType::CertificateRequest, &[0, 0, 0])
     }
 
     /// A `CertificateVerify` with a made-up `ecdsa_secp256r1_sha256` signature.
@@ -1026,6 +1059,95 @@ mod tests {
         let message = finished(&mut key_schedule);
         let result = verify_with(&mut handshake, &mut key_schedule, &mut provider, &message);
         assert!(matches!(result, Ok(State::ClientFinished)), "{result:?}");
+    }
+
+    #[test]
+    fn a_certificate_request_before_the_certificate_asks_for_a_client_certificate() {
+        let (mut handshake, mut key_schedule) = after_server_hello();
+        for message in [certificate_request(), certificate(), certificate_verify()] {
+            let result = verify(&mut handshake, &mut key_schedule, &message);
+            assert!(matches!(result, Ok(State::ServerVerify)), "{result:?}");
+        }
+        let message = finished(&mut key_schedule);
+        let result = verify(&mut handshake, &mut key_schedule, &message);
+        assert!(matches!(result, Ok(State::ClientCert)), "{result:?}");
+    }
+
+    /// RFC 8446, Section 4.3.2: a server that authenticates with a pre-shared key must not send
+    /// a `CertificateRequest`.
+    #[test]
+    fn a_certificate_request_after_a_selected_psk_is_refused() {
+        let (mut handshake, mut key_schedule) = after_server_hello();
+        handshake.server_auth = ServerAuth::Psk;
+        let result = verify(&mut handshake, &mut key_schedule, &certificate_request());
+        assert!(
+            matches!(result, Err(TlsError::InvalidHandshake)),
+            "{result:?}"
+        );
+        assert!(handshake.certificate_request.is_none());
+    }
+
+    /// RFC 8446, Section 4.3.2: a `CertificateRequest` comes before the server's `Certificate`.
+    #[test]
+    fn a_certificate_request_after_the_certificate_is_refused() {
+        for messages in [
+            std::vec![certificate()],
+            std::vec![certificate(), certificate_verify()],
+        ] {
+            let (mut handshake, mut key_schedule) = after_server_hello();
+            for message in messages {
+                let result = verify(&mut handshake, &mut key_schedule, &message);
+                assert!(matches!(result, Ok(State::ServerVerify)), "{result:?}");
+            }
+            let result = verify(&mut handshake, &mut key_schedule, &certificate_request());
+            assert!(
+                matches!(result, Err(TlsError::InvalidHandshake)),
+                "{result:?}"
+            );
+            assert!(handshake.certificate_request.is_none());
+        }
+    }
+
+    /// RFC 8446, Section 4.4.2.4: an empty `certificate_list` is refused with `decode_error`,
+    /// even by a verifier that accepts any certificate.
+    #[test]
+    fn an_empty_certificate_list_is_refused() {
+        let (mut handshake, mut key_schedule) = after_server_hello();
+        let result = verify(&mut handshake, &mut key_schedule, &empty_certificate());
+        assert!(
+            matches!(
+                result,
+                Err(TlsError::AbortHandshake(
+                    AlertLevel::Fatal,
+                    AlertDescription::DecodeError
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(handshake.server_auth, ServerAuth::None);
+    }
+
+    /// The empty `certificate_list` is refused before the provider is asked for a verifier.
+    #[test]
+    fn an_empty_certificate_list_is_refused_before_the_verifier() {
+        let (mut handshake, mut key_schedule) = after_server_hello();
+        let result = verify_with(
+            &mut handshake,
+            &mut key_schedule,
+            &mut WithoutVerifier,
+            &empty_certificate(),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(TlsError::AbortHandshake(
+                    AlertLevel::Fatal,
+                    AlertDescription::DecodeError
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(handshake.server_auth, ServerAuth::None);
     }
 
     /// The bytes of a record: its header, then `fragment`.
