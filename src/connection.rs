@@ -4,7 +4,7 @@ use crate::key_schedule::{KeySchedule, ReadKeySchedule, WriteKeySchedule};
 use crate::record::{ClientRecord, ServerRecord};
 use crate::record_reader::RecordReader;
 use crate::write_buffer::WriteBuffer;
-use crate::{CertificateVerify, CryptoProvider, TlsError, TlsVerifier};
+use crate::{CertificateVerify, CryptoProvider, SignatureScheme, TlsError, TlsVerifier};
 use crate::{
     alert::{Alert, AlertDescription, AlertLevel},
     handshake::{certificate::CertificateRef, certificate_request::CertificateRequest},
@@ -619,6 +619,53 @@ where
         .map(|slice| (next_state, slice))
 }
 
+/// The content that the client's `CertificateVerify` signs (RFC 8446 section 4.4.3): 64 spaces,
+/// the context string with its zero byte, then the transcript hash.
+fn certificate_verify_content(transcript_hash: &[u8]) -> Result<heapless::Vec<u8, 146>, TlsError> {
+    const CONTEXT: &[u8] = b"TLS 1.3, client CertificateVerify\x00";
+
+    // 64 (pad) + 34 (ctx) + 48 (SHA-384) = 146 bytes required
+    let mut content: heapless::Vec<u8, 146> = heapless::Vec::new();
+    content
+        .resize(64, 0x20)
+        .map_err(|_| TlsError::EncodeError)?;
+    content
+        .extend_from_slice(CONTEXT)
+        .map_err(|_| TlsError::EncodeError)?;
+    content
+        .extend_from_slice(transcript_hash)
+        .map_err(|_| TlsError::EncodeError)?;
+    Ok(content)
+}
+
+/// Signs the client's `CertificateVerify` over `transcript_hash` with `signer`.
+///
+/// It calls `try_sign`, not `sign`, which panics when signing fails: an error of the signer, of
+/// its RNG or of a hardware key is returned as `CryptoError`, and a signature that does not fit
+/// the message as `EncodeError`.
+fn sign_certificate_verify<S: AsRef<[u8]>>(
+    signer: &mut impl SignerMut<S>,
+    signature_scheme: SignatureScheme,
+    transcript_hash: &[u8],
+) -> Result<CertificateVerify, TlsError> {
+    let content = certificate_verify_content(transcript_hash)?;
+    let signature = signer
+        .try_sign(&content)
+        .map_err(|_| TlsError::CryptoError)?;
+
+    trace!(
+        "Signature: {:?} ({})",
+        signature.as_ref(),
+        signature.as_ref().len()
+    );
+
+    Ok(CertificateVerify {
+        signature_scheme,
+        signature: heapless::Vec::from_slice(signature.as_ref())
+            .map_err(|_| TlsError::EncodeError)?,
+    })
+}
+
 fn client_cert_verify<'r, Provider>(
     key_schedule: &mut KeySchedule<Provider::CipherSuite>,
     crypto_provider: &mut Provider,
@@ -627,41 +674,20 @@ fn client_cert_verify<'r, Provider>(
 where
     Provider: CryptoProvider,
 {
-    let (result, record) = match crypto_provider.signer() {
-        Ok((mut signing_key, signature_scheme)) => {
-            let ctx_str = b"TLS 1.3, client CertificateVerify\x00";
+    let transcript_hash = key_schedule.transcript_hash().clone().finalize();
+    let signed = crypto_provider
+        .signer()
+        .and_then(|(mut signer, signature_scheme)| {
+            sign_certificate_verify(&mut signer, signature_scheme, transcript_hash.as_slice())
+        });
 
-            // 64 (pad) + 34 (ctx) + 48 (SHA-384) = 146 bytes required
-            let mut msg: heapless::Vec<u8, 146> = heapless::Vec::new();
-            msg.resize(64, 0x20).map_err(|_| TlsError::EncodeError)?;
-            msg.extend_from_slice(ctx_str)
-                .map_err(|_| TlsError::EncodeError)?;
-            msg.extend_from_slice(&key_schedule.transcript_hash().clone().finalize())
-                .map_err(|_| TlsError::EncodeError)?;
-
-            let signature = signing_key.sign(&msg);
-
-            trace!(
-                "Signature: {:?} ({})",
-                signature.as_ref(),
-                signature.as_ref().len()
-            );
-
-            let certificate_verify = CertificateVerify {
-                signature_scheme,
-                signature: heapless::Vec::from_slice(signature.as_ref()).unwrap(),
-            };
-
-            (
-                Ok(State::ClientFinished),
-                ClientRecord::Handshake(
-                    ClientHandshake::ClientCertVerify(certificate_verify),
-                    true,
-                ),
-            )
-        }
+    let (result, record) = match signed {
+        Ok(certificate_verify) => (
+            Ok(State::ClientFinished),
+            ClientRecord::Handshake(ClientHandshake::ClientCertVerify(certificate_verify), true),
+        ),
         Err(e) => {
-            error!("Failed to obtain signing key: {:?}", e);
+            error!("Failed to sign the client CertificateVerify: {:?}", e);
             (
                 Err(e),
                 ClientRecord::Alert(
@@ -1344,5 +1370,189 @@ mod tests {
         );
         assert!(matches!(result, Ok(State::ServerVerify)), "{result:?}");
         assert_eq!(handshake.server_auth, ServerAuth::None);
+    }
+
+    /// The P-256 client key of the integration tests, as SEC1 DER.
+    fn client_key_der() -> std::vec::Vec<u8> {
+        pem_parser::pem_to_der(include_str!("../tests/data/client-key.pem"))
+    }
+
+    /// A provider that signs the client `CertificateVerify` with `signer`.
+    struct SignWith<F>(F);
+
+    impl<F, Signer> CryptoProvider for SignWith<F>
+    where
+        F: FnMut() -> Signer,
+        Signer: SignerMut<p256::ecdsa::DerSignature>,
+    {
+        type CipherSuite = Suite;
+        type Signature = p256::ecdsa::DerSignature;
+
+        fn rng(&mut self) -> impl crate::CryptoRng {
+            UnwrapErr(SysRng)
+        }
+
+        fn signer(
+            &mut self,
+        ) -> Result<(impl SignerMut<Self::Signature>, SignatureScheme), TlsError> {
+            Ok(((self.0)(), SignatureScheme::EcdsaSecp256r1Sha256))
+        }
+    }
+
+    /// An RNG that always fails, like a hardware RNG that stopped working.
+    struct FailingRng;
+
+    #[derive(Debug)]
+    struct RngFailure;
+
+    impl core::fmt::Display for RngFailure {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("RNG failure")
+        }
+    }
+
+    impl core::error::Error for RngFailure {}
+
+    impl rand_core::TryRng for FailingRng {
+        type Error = RngFailure;
+
+        fn try_next_u32(&mut self) -> Result<u32, RngFailure> {
+            Err(RngFailure)
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, RngFailure> {
+            Err(RngFailure)
+        }
+
+        fn try_fill_bytes(&mut self, _dst: &mut [u8]) -> Result<(), RngFailure> {
+            Err(RngFailure)
+        }
+    }
+
+    impl rand_core::TryCryptoRng for FailingRng {}
+
+    /// Runs `client_cert_verify` with `provider` in the state of `after_server_hello`, so every
+    /// call signs the same transcript, and opens the record it writes with the client's
+    /// handshake traffic key, as the server does. Returns the result, the transcript hash and
+    /// the record's plaintext (the message, then its content type).
+    fn certificate_verify_record<Provider: CryptoProvider<CipherSuite = Suite>>(
+        provider: &mut Provider,
+    ) -> (
+        Result<State, TlsError>,
+        std::vec::Vec<u8>,
+        std::vec::Vec<u8>,
+    ) {
+        let (_, mut key_schedule) = after_server_hello();
+        let transcript_hash = key_schedule.transcript_hash().clone().finalize().to_vec();
+        let mut buf = [0; 1024];
+        let mut buffer = WriteBuffer::new(&mut buf);
+        let (result, record) =
+            client_cert_verify(&mut key_schedule, provider, &mut buffer).unwrap();
+        let mut record = record.to_vec();
+
+        // The server's view of the client's handshake traffic key, before any record.
+        let (_, mut server) = after_server_hello();
+        let write = server.write_state();
+        let (header, data) = record.split_at_mut(crate::record::RecordHeader::LEN);
+        let tag_len = <Cipher as AeadCore>::TagSize::to_usize();
+        let (plaintext, tag) = data.split_at_mut(data.len() - tag_len);
+        let tag = aes_gcm::aead::Tag::<Cipher>::try_from(&*tag).unwrap();
+        <Cipher as KeyInit>::new(write.get_key().unwrap())
+            .decrypt_inout_detached(
+                &write.get_nonce().unwrap(),
+                header,
+                (&mut *plaintext).into(),
+                &tag,
+            )
+            .unwrap();
+        (result, transcript_hash, plaintext.to_vec())
+    }
+
+    /// The signature in the plaintext of a client `CertificateVerify` record, after checking its
+    /// framing and its `ecdsa_secp256r1_sha256` scheme.
+    fn certificate_verify_signature(plaintext: &[u8]) -> &[u8] {
+        let (content_type, message) = plaintext.split_last().unwrap();
+        assert_eq!(*content_type, ContentType::Handshake as u8);
+        assert_eq!(message[0], HandshakeType::CertificateVerify as u8);
+        assert_eq!(
+            u32::from_be_bytes([0, message[1], message[2], message[3]]) as usize,
+            message.len() - 4
+        );
+        assert_eq!(
+            u16::from_be_bytes([message[4], message[5]]),
+            SignatureScheme::EcdsaSecp256r1Sha256.as_u16()
+        );
+        let signature = &message[8..];
+        assert_eq!(
+            usize::from(u16::from_be_bytes([message[6], message[7]])),
+            signature.len()
+        );
+        signature
+    }
+
+    /// Checks `signature` over the `CertificateVerify` content of `transcript_hash` with the
+    /// public key of the client key, as the server does (RFC 8446 section 4.4.3).
+    fn verify_client_signature(transcript_hash: &[u8], signature: &[u8]) {
+        use signature::Verifier;
+
+        let secret_key = p256::SecretKey::from_sec1_der(&client_key_der()).unwrap();
+        let signing_key = p256::ecdsa::SigningKey::from(&secret_key);
+        let signature = p256::ecdsa::DerSignature::try_from(signature).unwrap();
+        let content = certificate_verify_content(transcript_hash).unwrap();
+        signing_key
+            .verifying_key()
+            .verify(&content, &signature)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_unsecure_provider_signs_one_transcript_hedged() {
+        let key = client_key_der();
+        let mut provider = UnsecureProvider::new::<Suite>(UnwrapErr(SysRng)).with_priv_key(&key);
+        let (first, first_hash, first_record) = certificate_verify_record(&mut provider);
+        let (second, second_hash, second_record) = certificate_verify_record(&mut provider);
+        assert!(matches!(first, Ok(State::ClientFinished)), "{first:?}");
+        assert!(matches!(second, Ok(State::ClientFinished)), "{second:?}");
+        assert_eq!(first_hash, second_hash);
+
+        let first_signature = certificate_verify_signature(&first_record);
+        let second_signature = certificate_verify_signature(&second_record);
+        assert_ne!(first_signature, second_signature);
+        verify_client_signature(&first_hash, first_signature);
+        verify_client_signature(&second_hash, second_signature);
+    }
+
+    #[test]
+    fn a_deterministic_signer_signs_one_transcript_alike() {
+        let secret_key = p256::SecretKey::from_sec1_der(&client_key_der()).unwrap();
+        let mut provider =
+            SignWith(|| crate::SignerRef(p256::ecdsa::SigningKey::from(&secret_key)));
+        let (first, hash, first_record) = certificate_verify_record(&mut provider);
+        let (second, _, second_record) = certificate_verify_record(&mut provider);
+        assert!(matches!(first, Ok(State::ClientFinished)), "{first:?}");
+        assert!(matches!(second, Ok(State::ClientFinished)), "{second:?}");
+
+        let signature = certificate_verify_signature(&first_record);
+        assert_eq!(signature, certificate_verify_signature(&second_record));
+        verify_client_signature(&hash, signature);
+    }
+
+    #[test]
+    fn a_failing_signer_fails_the_handshake_without_panicking() {
+        let (result, _, plaintext) =
+            certificate_verify_record(&mut SignWith(|| crate::config::NoSign));
+        assert!(matches!(result, Err(TlsError::CryptoError)), "{result:?}");
+        assert_eq!(plaintext.last(), Some(&(ContentType::Alert as u8)));
+    }
+
+    #[test]
+    fn a_failing_rng_fails_the_hedged_signature_without_panicking() {
+        let secret_key = p256::SecretKey::from_sec1_der(&client_key_der()).unwrap();
+        let mut provider = SignWith(|| {
+            crate::RandomizedSignerRef::new(p256::ecdsa::SigningKey::from(&secret_key), FailingRng)
+        });
+        let (result, _, plaintext) = certificate_verify_record(&mut provider);
+        assert!(matches!(result, Err(TlsError::CryptoError)), "{result:?}");
+        assert_eq!(plaintext.last(), Some(&(ContentType::Alert as u8)));
     }
 }

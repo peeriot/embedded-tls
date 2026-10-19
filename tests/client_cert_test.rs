@@ -180,3 +180,48 @@ async fn test_client_certificate_auth() {
         .map_err(|(_, e)| e)
         .expect("error closing session");
 }
+
+/// The built-in `UnsecureProvider` signs the client `CertificateVerify` hedged (RFC 6979
+/// section 3.6), and the rustls server, which requires a client certificate, verifies it.
+#[tokio::test]
+async fn test_client_certificate_auth_with_hedged_unsecure_provider() {
+    use embedded_tls::*;
+    use tokio::net::TcpStream;
+    let addr = setup();
+
+    let client_cert_der = pem_parser::pem_to_der(include_str!("data/client-cert.pem"));
+    let private_key_der = pem_parser::pem_to_der(include_str!("data/client-key.pem"));
+
+    let config = TlsConfig::new().with_server_name("factbird.com");
+    let mut provider = UnsecureProvider::new::<Aes128GcmSha256>(UnwrapErr(SysRng))
+        .with_priv_key(&private_key_der)
+        .with_cert(Certificate::X509(&client_cert_der));
+
+    // Two connections, so the server verifies more than one hedged signature of this key.
+    for _ in 0..2 {
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("error connecting to server");
+        let mut read_record_buffer = [0; 16384];
+        let mut write_record_buffer = [0; 16384];
+        let mut tls = TlsConnection::new(
+            FromTokio::new(stream),
+            &mut read_record_buffer,
+            &mut write_record_buffer,
+        );
+        tls.open(TlsContext::new(&config, &mut provider))
+            .await
+            .expect("error establishing TLS connection");
+
+        tls.write(b"ping").await.expect("error writing data");
+        tls.flush().await.expect("error flushing data");
+        let mut rx_buf = [0; 4096];
+        let sz = tls.read(&mut rx_buf).await.expect("error reading data");
+        assert_eq!(b"ping", &rx_buf[..sz]);
+
+        tls.close()
+            .await
+            .map_err(|(_, e)| e)
+            .expect("error closing session");
+    }
+}

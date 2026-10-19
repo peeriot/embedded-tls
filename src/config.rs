@@ -13,7 +13,7 @@ use ecdsa::elliptic_curve::SecretKey;
 use heapless::Vec;
 use hybrid_array::ArraySize;
 use p256::ecdsa::SigningKey;
-use rand_core::CryptoRng;
+use rand_core::{CryptoRng, TryCryptoRng};
 pub use sha2::{Sha256, Sha384};
 use typenum::{Sum, U10, U12, U16, U32};
 
@@ -162,6 +162,11 @@ pub trait CryptoProvider {
     ///
     /// The provider resolves the private key internally (e.g. from memory, flash, or a hardware
     /// crypto module such as an HSM/TPM/secure element).
+    ///
+    /// The client signs its `CertificateVerify` with [`signature::SignerMut::try_sign`], and an
+    /// error from it fails the handshake with [`TlsError::CryptoError`]. Wrap a
+    /// [`signature::Signer`] in [`SignerRef`], or a [`signature::RandomizedSigner`] and an RNG in
+    /// [`RandomizedSignerRef`]; [`UnsecureProvider`] uses the latter and signs hedged.
     fn signer(
         &mut self,
     ) -> Result<(impl signature::SignerMut<Self::Signature>, SignatureScheme), crate::TlsError>
@@ -205,22 +210,58 @@ impl<T: CryptoProvider> CryptoProvider for &mut T {
     }
 }
 
+/// A signer without a key: every signature fails with an error.
 pub struct NoSign;
 
 impl<S> signature::SignerMut<S> for NoSign {
     fn try_sign(&mut self, _msg: &[u8]) -> Result<S, signature::Error> {
-        unimplemented!()
+        Err(signature::Error::new())
     }
 }
 
 /// Adapts a [`signature::Signer`], such as a `p256::ecdsa::SigningKey`, to the
 /// [`signature::SignerMut`] that [`CryptoProvider::signer`] returns. signature 3 no longer
 /// implements `SignerMut` for every `Signer`.
+///
+/// A `p256::ecdsa::SigningKey` signs deterministically through it (RFC 6979). To sign hedged,
+/// use [`RandomizedSignerRef`].
 pub struct SignerRef<T>(pub T);
 
 impl<S, T: signature::Signer<S>> signature::SignerMut<S> for SignerRef<T> {
     fn try_sign(&mut self, msg: &[u8]) -> Result<S, signature::Error> {
         self.0.try_sign(msg)
+    }
+}
+
+/// Adapts a [`signature::RandomizedSigner`] and the RNG it draws from to the
+/// [`signature::SignerMut`] that [`CryptoProvider::signer`] returns.
+///
+/// For ECDSA keys of ecdsa 0.17, such as `p256::ecdsa::SigningKey`, this signs hedged: the
+/// nonce is derived as in RFC 6979 section 3.2 from the key and the message, with fresh bytes
+/// from `rng` as the additional data of the RFC 6979 section 3.6 variant. The nonce stays
+/// secret and unique if the RNG fails silently, and two signatures of one message differ, which
+/// makes fault and side-channel attacks on the deterministic nonce harder.
+///
+/// An error of the RNG makes `try_sign` return an error, which the handshake reports as
+/// [`TlsError::CryptoError`].
+pub struct RandomizedSignerRef<T, R> {
+    pub signer: T,
+    pub rng: R,
+}
+
+impl<T, R> RandomizedSignerRef<T, R> {
+    pub fn new(signer: T, rng: R) -> Self {
+        Self { signer, rng }
+    }
+}
+
+impl<S, T, R> signature::SignerMut<S> for RandomizedSignerRef<T, R>
+where
+    T: signature::RandomizedSigner<S>,
+    R: TryCryptoRng,
+{
+    fn try_sign(&mut self, msg: &[u8]) -> Result<S, signature::Error> {
+        self.signer.try_sign_with_rng(&mut self.rng, msg)
     }
 }
 
@@ -285,8 +326,9 @@ impl<CipherSuite: TlsCipherSuite, RNG: CryptoRng> CryptoProvider
         let secret_key =
             SecretKey::from_sec1_der(key_der).map_err(|_| TlsError::InvalidPrivateKey)?;
 
+        // Hedged ECDSA (RFC 6979 section 3.6) with the provider's RNG, see `RandomizedSignerRef`.
         Ok((
-            SignerRef(SigningKey::from(&secret_key)),
+            RandomizedSignerRef::new(SigningKey::from(&secret_key), &mut self.rng),
             SignatureScheme::EcdsaSecp256r1Sha256,
         ))
     }

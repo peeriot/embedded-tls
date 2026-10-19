@@ -36,7 +36,7 @@ hybrid-array = { version = "0.4", default-features = false }
 webpki = { package = "rustls-webpki", version = "0.101.7", default-features = false, optional = true }
 const-oid = { version = "0.10.1", optional = true }
 der = { version = "0.8", features = ["derive", "oid", "time", "heapless"], optional = true }
-signature = { version = "3", default-features = false }
+signature = { version = "3", default-features = false, features = ["rand_core"] }
 ecdsa = { version = "0.17", default-features = false }
 
 # Logging alternatives
