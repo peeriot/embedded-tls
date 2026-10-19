@@ -541,9 +541,14 @@ where
                         //
                         // A CertificateRequest comes right after EncryptedExtensions, before
                         // the server's Certificate, and a server that authenticates with a
-                        // pre-shared key must not send one.
+                        // pre-shared key must not send one. The handshake has room for one
+                        // CertificateRequest only, so a second one is refused too.
                         if handshake.server_auth != ServerAuth::None {
                             warn!("CertificateRequest refused: the server already authenticated");
+                            return Err(TlsError::InvalidHandshake);
+                        }
+                        if handshake.certificate_request.is_some() {
+                            warn!("CertificateRequest refused: the server already sent one");
                             return Err(TlsError::InvalidHandshake);
                         }
                         handshake.certificate_request.replace(request.try_into()?);
@@ -1136,6 +1141,21 @@ mod tests {
             );
             assert!(handshake.certificate_request.is_none());
         }
+    }
+
+    /// RFC 8446, Section 4.3.2: the server sends at most one `CertificateRequest`, right after
+    /// `EncryptedExtensions`, so a second one is refused.
+    #[test]
+    fn a_second_certificate_request_is_refused() {
+        let (mut handshake, mut key_schedule) = after_server_hello();
+        let result = verify(&mut handshake, &mut key_schedule, &certificate_request());
+        assert!(matches!(result, Ok(State::ServerVerify)), "{result:?}");
+        let result = verify(&mut handshake, &mut key_schedule, &certificate_request());
+        assert!(
+            matches!(result, Err(TlsError::InvalidHandshake)),
+            "{result:?}"
+        );
+        assert!(handshake.certificate_request.is_some());
     }
 
     /// RFC 8446, Section 4.4.2.4: an empty `certificate_list` is refused with `decode_error`,
