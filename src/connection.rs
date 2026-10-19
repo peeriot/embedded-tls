@@ -57,22 +57,20 @@ where
         crypto.decrypt(&nonce, header.data(), ciphertext, tag)?;
         app_data.truncate(ciphertext_len);
 
-        let padding = app_data
+        // The content type is the last non-zero octet; the zeros after it are padding. A
+        // plaintext with no non-zero octet is refused (RFC 8446 section 5.4).
+        let (index, &content_type) = app_data
             .as_slice()
             .iter()
             .enumerate()
-            .rfind(|(_, b)| **b != 0);
-        if let Some((index, _)) = padding {
-            app_data.truncate(index + 1);
-        };
-
-        let content_type =
-            ContentType::of(*app_data.as_slice().last().unwrap()).ok_or(TlsError::InvalidRecord)?;
+            .rfind(|(_, b)| **b != 0)
+            .ok_or(TlsError::InvalidRecord)?;
+        let content_type = ContentType::of(content_type).ok_or(TlsError::InvalidRecord)?;
 
         trace!("Decrypting: content type = {:?}", content_type);
 
-        // Remove the content type
-        app_data.truncate(app_data.len() - 1);
+        // Remove the content type and the padding
+        app_data.truncate(index);
 
         let mut buf = ParseBuffer::new(app_data.as_slice());
         match content_type {
@@ -683,6 +681,7 @@ mod tests {
     use crate::handshake::server_hello::ServerHello;
 
     type Suite = Aes128GcmSha256;
+    type Cipher = <Suite as TlsCipherSuite>::Cipher;
 
     /// The client's state after a `ServerHello` from a peer that chose its own key share, so the
     /// peer knows the handshake secret.
@@ -927,6 +926,74 @@ mod tests {
         assert!(
             matches!(result, Err(TlsError::InvalidHandshake)),
             "{result:?}"
+        );
+    }
+
+    /// Seals `plaintext` (the content, its content type, then any zero padding) with the server's
+    /// handshake traffic key, as a peer that knows the handshake secret can, and decrypts it.
+    /// Returns the content type and the content of each record that `decrypt_record` passes on.
+    fn open_sealed(
+        plaintext: &[u8],
+    ) -> Result<std::vec::Vec<(ContentType, std::vec::Vec<u8>)>, TlsError> {
+        let (_, mut key_schedule) = after_server_hello();
+        let read = key_schedule.read_state();
+        let len = ((plaintext.len() + TAG_LEN) as u16).to_be_bytes();
+        let header = [
+            ContentType::ApplicationData as u8,
+            0x03,
+            0x03,
+            len[0],
+            len[1],
+        ];
+        let crypto = <Cipher as TlsAead>::new(read.get_key()?);
+        let mut data = plaintext.to_vec();
+        let tag = <Cipher as TlsAead>::encrypt(&crypto, &read.get_nonce()?, &header, &mut data)?;
+        data.extend_from_slice(&tag);
+
+        let len = data.len();
+        let record = ServerRecord::ApplicationData(ApplicationData::new(
+            CryptoBuffer::wrap_with_pos(&mut data, len),
+            crate::record::RecordHeader::decode(header)?,
+        ));
+        let mut records = std::vec::Vec::new();
+        decrypt_record(read, record, |_, record| {
+            let content = match &record {
+                ServerRecord::ApplicationData(app_data) => app_data.data.as_slice().to_vec(),
+                _ => std::vec::Vec::new(),
+            };
+            records.push((record.content_type(), content));
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    #[test]
+    fn a_padded_record_is_opened() {
+        let records = open_sealed(&[b'h', b'i', ContentType::ApplicationData as u8, 0, 0]);
+        assert!(
+            matches!(
+                records.as_deref(),
+                Ok([(ContentType::ApplicationData, content)]) if content == b"hi"
+            ),
+            "{records:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_with_only_a_tag_is_refused() {
+        let records = open_sealed(&[]);
+        assert!(
+            matches!(records, Err(TlsError::InvalidRecord)),
+            "{records:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_with_only_padding_is_refused() {
+        let records = open_sealed(&[0; 8]);
+        assert!(
+            matches!(records, Err(TlsError::InvalidRecord)),
+            "{records:?}"
         );
     }
 }
