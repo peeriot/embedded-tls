@@ -484,25 +484,33 @@ where
                         if handshake.server_auth != ServerAuth::None {
                             return Err(TlsError::InvalidHandshake);
                         }
+                        // (RFC 8446, Section 4.4.2.4)
+                        //
+                        // The client must verify the server's certificate, so a provider
+                        // without a verifier cannot accept one. `NoVerify` skips the check
+                        // only when the provider returns it explicitly.
+                        let verifier = crypto_provider.verifier().map_err(|_| {
+                            warn!("Certificate refused: the provider has no verifier");
+                            TlsError::InvalidHandshake
+                        })?;
                         let transcript = key_schedule.transcript_hash();
-                        if let Ok(verifier) = crypto_provider.verifier() {
-                            verifier.verify_certificate(transcript, certificate)?;
-                            debug!("Certificate verified!");
-                        } else {
-                            debug!("Certificate verification skipped due to no verifier!");
-                        }
+                        verifier.verify_certificate(transcript, certificate)?;
+                        debug!("Certificate verified!");
                         handshake.server_auth = ServerAuth::Certificate;
                     }
                     ServerHandshake::CertificateVerify(verify) => {
                         if handshake.server_auth != ServerAuth::Certificate {
                             return Err(TlsError::InvalidHandshake);
                         }
-                        if let Ok(verifier) = crypto_provider.verifier() {
-                            verifier.verify_signature(verify)?;
-                            debug!("Signature verified!");
-                        } else {
-                            debug!("Signature verification skipped due to no verifier!");
-                        }
+                        // (RFC 8446, Section 4.4.3)
+                        //
+                        // The client must verify the signature with the certificate's key.
+                        let verifier = crypto_provider.verifier().map_err(|_| {
+                            warn!("CertificateVerify refused: the provider has no verifier");
+                            TlsError::InvalidHandshake
+                        })?;
+                        verifier.verify_signature(verify)?;
+                        debug!("Signature verified!");
                         handshake.server_auth = ServerAuth::Signed;
                     }
                     ServerHandshake::CertificateRequest(request) => {
@@ -961,27 +969,54 @@ mod tests {
         );
     }
 
-    // Backport to 0.19: a provider without a verifier skips the certificate and signature
-    // checks, but the order of the messages is still enforced.
+    /// A provider that keeps the default `verifier()`, which returns an error.
+    struct WithoutVerifier;
+
+    impl CryptoProvider for WithoutVerifier {
+        type CipherSuite = Suite;
+        type Signature = p256::ecdsa::DerSignature;
+
+        fn rng(&mut self) -> impl crate::CryptoRngCore {
+            OsRng
+        }
+    }
 
     #[test]
-    fn finished_without_a_certificate_is_refused_without_a_verifier() {
+    fn a_certificate_is_refused_by_a_provider_without_a_verifier() {
         let (mut handshake, mut key_schedule) = after_server_hello();
-        let record = finished(&mut key_schedule);
         let result = process_server_verify(
             &mut handshake,
             &mut key_schedule,
-            &mut UnsecureProvider::new::<Suite>(OsRng),
-            record,
+            &mut WithoutVerifier,
+            certificate(),
         );
         assert!(
             matches!(result, Err(TlsError::InvalidHandshake)),
             "{result:?}"
         );
+        assert_eq!(handshake.server_auth, ServerAuth::None);
     }
 
     #[test]
-    fn certificate_then_certificate_verify_then_finished_is_accepted_without_a_verifier() {
+    fn a_certificate_verify_is_refused_by_a_provider_without_a_verifier() {
+        let (mut handshake, mut key_schedule) = after_server_hello();
+        handshake.server_auth = ServerAuth::Certificate;
+        let result = process_server_verify(
+            &mut handshake,
+            &mut key_schedule,
+            &mut WithoutVerifier,
+            certificate_verify(),
+        );
+        assert!(
+            matches!(result, Err(TlsError::InvalidHandshake)),
+            "{result:?}"
+        );
+        assert_eq!(handshake.server_auth, ServerAuth::Certificate);
+    }
+
+    /// `UnsecureProvider` opts out of verification explicitly with `NoVerify`.
+    #[test]
+    fn certificate_then_certificate_verify_then_finished_is_accepted_by_unsecure_provider() {
         let (mut handshake, mut key_schedule) = after_server_hello();
         let mut provider = UnsecureProvider::new::<Suite>(OsRng);
         for record in [certificate(), certificate_verify()] {

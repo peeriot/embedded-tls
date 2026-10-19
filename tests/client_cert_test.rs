@@ -1,6 +1,6 @@
 use ecdsa::elliptic_curve::SecretKey;
 use embedded_io_adapters::tokio_1::FromTokio;
-use embedded_tls::{Certificate, CryptoProvider, SignatureScheme};
+use embedded_tls::{Certificate, CryptoProvider, NoVerify, SignatureScheme, TlsVerifier};
 use p256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
 use rand_core::CryptoRngCore;
@@ -70,6 +70,7 @@ fn setup() -> SocketAddr {
 
 struct Provider<'a> {
     rng: OsRng,
+    verifier: NoVerify,
     priv_key: &'a [u8],
     client_cert: Option<Certificate<&'a [u8]>>,
 }
@@ -80,6 +81,12 @@ impl CryptoProvider for Provider<'_> {
 
     fn rng(&mut self) -> impl CryptoRngCore {
         &mut self.rng
+    }
+
+    fn verifier(
+        &mut self,
+    ) -> Result<&mut impl TlsVerifier<Self::CipherSuite>, embedded_tls::TlsError> {
+        Ok(&mut self.verifier)
     }
 
     fn signer(
@@ -131,6 +138,7 @@ async fn test_client_certificate_auth() {
 
     let mut provider = Provider {
         rng: OsRng,
+        verifier: NoVerify,
         priv_key: &private_key_der,
         client_cert: Some(Certificate::X509(&client_cert_der)),
     };

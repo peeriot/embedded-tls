@@ -91,6 +91,11 @@ where
     fn verify_signature(&mut self, verify: CertificateVerifyRef) -> Result<(), crate::TlsError>;
 }
 
+/// A verifier that accepts every certificate and every signature.
+///
+/// It authenticates nothing: a client that uses it completes a handshake with anyone who can
+/// intercept the connection. Return it from [`CryptoProvider::verifier`] only when the server is
+/// authenticated by other means, such as a pre-shared key, or for testing.
 pub struct NoVerify;
 
 impl<CipherSuite> TlsVerifier<CipherSuite> for NoVerify
@@ -144,6 +149,11 @@ pub trait CryptoProvider {
 
     fn rng(&mut self) -> impl CryptoRngCore;
 
+    /// Provide the verifier for the server's `Certificate` and `CertificateVerify`.
+    ///
+    /// The default returns an error, and the client then refuses any server that authenticates
+    /// with a certificate, so only a handshake with a pre-shared key can succeed. To skip
+    /// certificate verification, return [`NoVerify`] explicitly.
     fn verifier(&mut self) -> Result<&mut impl TlsVerifier<Self::CipherSuite>, crate::TlsError> {
         Err::<&mut NoVerify, _>(crate::TlsError::Unimplemented)
     }
@@ -203,8 +213,14 @@ impl<S> signature::Signer<S> for NoSign {
     }
 }
 
+/// A provider that does not verify the server.
+///
+/// Its verifier is [`NoVerify`], which accepts every certificate and every signature, so a client
+/// that uses it completes a handshake with anyone who can intercept the connection. Use it only
+/// when the server is authenticated by other means, such as a pre-shared key, or for testing.
 pub struct UnsecureProvider<'a, CipherSuite, RNG> {
     rng: RNG,
+    verifier: NoVerify,
     priv_key: Option<&'a [u8]>,
     client_cert: Option<Certificate<&'a [u8]>>,
     _marker: PhantomData<CipherSuite>,
@@ -216,6 +232,7 @@ impl<RNG: CryptoRngCore> UnsecureProvider<'_, (), RNG> {
     ) -> UnsecureProvider<'static, CipherSuite, RNG> {
         UnsecureProvider {
             rng,
+            verifier: NoVerify,
             priv_key: None,
             client_cert: None,
             _marker: PhantomData,
@@ -243,6 +260,10 @@ impl<CipherSuite: TlsCipherSuite, RNG: CryptoRngCore> CryptoProvider
 
     fn rng(&mut self) -> impl CryptoRngCore {
         &mut self.rng
+    }
+
+    fn verifier(&mut self) -> Result<&mut impl TlsVerifier<CipherSuite>, crate::TlsError> {
+        Ok(&mut self.verifier)
     }
 
     fn signer(
